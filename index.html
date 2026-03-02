@@ -1,0 +1,407 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Device-ID Admin</title>
+  <style>
+    body{font-family:system-ui,Arial;padding:16px;max-width:1100px;margin:auto}
+    input,select,textarea,button{padding:10px;font-size:16px;box-sizing:border-box}
+    button{cursor:pointer}
+    .card{border:1px solid #ddd;border-radius:14px;padding:12px;margin:12px 0}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+    .row4{display:grid;grid-template-columns:1.2fr 1fr 1fr 1fr;gap:10px}
+    @media (max-width:820px){
+      .row,.row3,.row4{grid-template-columns:1fr}
+    }
+    table{width:100%;border-collapse:collapse}
+    th,td{border-bottom:1px solid #eee;padding:10px;vertical-align:top;text-align:left}
+    .muted{opacity:.7}
+    .badge{display:inline-block;padding:3px 10px;border:1px solid #ddd;border-radius:999px;font-size:12px}
+    .ok{border-color:#b7e3c7}
+    .bad{border-color:#f2b8b5}
+    .actions button{margin-right:6px}
+    .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}
+  </style>
+</head>
+<body>
+
+<h2>Device-ID Admin Panel</h2>
+
+<div class="card">
+  <div class="row">
+    <input id="apiUrl" placeholder="Vercel API URL (https://.../api/deviceid-save)">
+    <input id="adminKey" placeholder="Admin Key">
+  </div>
+  <div class="row">
+    <input id="rawUrl" value="https://raw.githubusercontent.com/PRENDLYMADAPAKER/Device-ID/refs/heads/main/Device%20ID" placeholder="Raw URL (read list)">
+    <button onclick="loadFromRaw()">Load Current List</button>
+  </div>
+  <div class="muted">
+    Tip: Load → review/edit entries → then use <b>Replace & Commit</b> if you changed/removals. Use <b>Append</b> for quick adds.
+  </div>
+</div>
+
+<div class="card">
+  <h3>Add subscriber (auto compute)</h3>
+  <div class="row4">
+    <input id="name" placeholder="Name (e.g. Ar Chi)">
+    <select id="months">
+      <option value="1">1 month</option>
+      <option value="2">2 months</option>
+      <option value="3">3 months</option>
+      <option value="6" selected>6 months</option>
+      <option value="12">12 months</option>
+    </select>
+    <input id="start" type="date">
+    <input id="deviceId" class="mono" placeholder="Device ID (hash)">
+  </div>
+  <div class="row">
+    <input id="notes" placeholder="Notes (optional e.g. reseller, CP & TV, etc.)">
+    <button onclick="addSubscriber()">Add to Table</button>
+  </div>
+
+  <div class="row">
+    <button onclick="appendLastAdded()">Append LAST Added & Commit</button>
+    <button onclick="replaceAllToGitHub()">Replace ALL & Commit</button>
+  </div>
+  <div class="muted">
+    “Append last added” = fastest. “Replace all” = for edits/removals/clean format.
+  </div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <input id="search" placeholder="Search name / device id..." oninput="render()">
+    <select id="sort" onchange="render()">
+      <option value="end_asc">Sort: End date (soonest)</option>
+      <option value="end_desc">Sort: End date (latest)</option>
+      <option value="name_asc">Sort: Name (A-Z)</option>
+      <option value="name_desc">Sort: Name (Z-A)</option>
+    </select>
+  </div>
+</div>
+
+<div class="card">
+  <h3>Subscribers</h3>
+  <div class="muted" id="stats"></div>
+  <div style="overflow:auto">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Device ID</th>
+          <th>Start</th>
+          <th>End</th>
+          <th>Status</th>
+          <th>Notes</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <h3>Raw file preview (read-only)</h3>
+  <textarea id="rawPreview" rows="10" readonly class="mono" placeholder="Click Load Current List..."></textarea>
+</div>
+
+<script>
+  // ---------- Storage ----------
+  const LS = "deviceid_admin_v2";
+  let entries = loadLocal();
+  let lastAddedIndex = null;
+
+  function loadLocal(){
+    try { return JSON.parse(localStorage.getItem(LS)) || []; }
+    catch { return []; }
+  }
+  function saveLocal(){
+    localStorage.setItem(LS, JSON.stringify(entries));
+  }
+
+  // ---------- Date helpers ----------
+  function todayISO(){
+    return new Date().toISOString().slice(0,10);
+  }
+  function addMonths(dateStr, months){
+    const d = new Date(dateStr + "T00:00:00");
+    const day = d.getDate();
+    d.setMonth(d.getMonth() + Number(months));
+    // fix rollover (e.g., Jan 31)
+    if (d.getDate() !== day) d.setDate(0);
+    return d.toISOString().slice(0,10);
+  }
+  function statusOf(end){
+    return end >= todayISO() ? "Active" : "Expired";
+  }
+  function escapeHtml(s){
+    return String(s||"").replace(/[&<>"']/g, m => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
+    }[m]));
+  }
+
+  // ---------- Parsing your current text format ----------
+  // Expected blocks separated by blank lines:
+  // Line 1: Name ... ( ... start to end ... )
+  // Line 2+: one or more device/hash lines or extra notes lines
+  function parseDeviceIdFile(text){
+    const blocks = String(text||"").replace(/\r/g,"").split(/\n\s*\n+/).map(b => b.trim()).filter(Boolean);
+    const out = [];
+
+    for(const b of blocks){
+      const lines = b.split("\n").map(x=>x.trim()).filter(Boolean);
+      if(!lines.length) continue;
+
+      const header = lines[0];
+      // Try to extract start/end like ( 11-06-25 to 5-07-26 ) or (11-06-25 - 5-07-26)
+      const m = header.match(/\(([^)]*?)\)/);
+      let start=null,end=null;
+      if(m){
+        const inside = m[1];
+        const mm = inside.match(/(\d{1,2}-\d{1,2}-\d{2}).*?(?:to|-)\s*(\d{1,2}-\d{1,2}-\d{2})/i);
+        if(mm){
+          start = toISO(mm[1]);
+          end = toISO(mm[2]);
+        }
+      }
+
+      const namePart = header.replace(/\(.*\)/, "").trim();
+      // Heuristic: first long hex line = deviceId
+      let deviceId = "";
+      let notes = "";
+      for(let i=1;i<lines.length;i++){
+        const line = lines[i];
+        if(!deviceId && /^[a-f0-9]{30,}$/i.test(line.replace(/\s/g,""))){
+          deviceId = line.replace(/\s/g,"");
+        } else {
+          notes += (notes ? " | " : "") + line;
+        }
+      }
+
+      out.push({
+        id: cryptoRandomId(),
+        name: namePart,
+        deviceId,
+        start: start || "",
+        end: end || "",
+        months: "",
+        notes
+      });
+    }
+    return out;
+  }
+
+  // Convert "MM-DD-YY" to "20YY-MM-DD" (assumes 2000+)
+  function toISO(mdyy){
+    const [mm,dd,yy] = mdyy.split("-").map(x=>x.trim());
+    const Y = Number(yy) + 2000;
+    const M = String(mm).padStart(2,"0");
+    const D = String(dd).padStart(2,"0");
+    return `${Y}-${M}-${D}`;
+  }
+  function fromISO(iso){
+    // "YYYY-MM-DD" -> "M-D-YY" (no leading zeros, like your file)
+    const [Y,M,D] = iso.split("-");
+    const yy = String(Number(Y) - 2000).padStart(2,"0");
+    return `${Number(M)}-${Number(D)}-${yy}`;
+  }
+
+  function cryptoRandomId(){
+    // small unique id
+    return (Math.random().toString(16).slice(2) + Date.now().toString(16)).slice(0,16);
+  }
+
+  // ---------- Build file text from entries ----------
+  function buildFileText(list){
+    // Keep close to your format:
+    // Name <months text> ( start to end )
+    // deviceId
+    // notes (optional)
+    // blank line
+    return list.map(e => {
+      const monthsLabel = e.months ? `${e.months}months` : (e.planText || "").trim();
+      const headerParts = [e.name.trim()];
+      if(monthsLabel) headerParts.push(monthsLabel);
+      const range = (e.start && e.end) ? `(${fromISO(e.start)} to ${fromISO(e.end)})` : "";
+      const header = `${headerParts.join(" ").replace(/\s+/g," ").trim()} ${range}`.trim();
+
+      const lines = [header];
+      if(e.deviceId) lines.push(e.deviceId.trim());
+      if(e.notes) lines.push(e.notes.trim());
+      return lines.join("\n");
+    }).join("\n\n") + "\n";
+  }
+
+  // ---------- UI actions ----------
+  function addSubscriber(){
+    const name = document.getElementById("name").value.trim();
+    const deviceId = document.getElementById("deviceId").value.trim();
+    const months = Number(document.getElementById("months").value);
+    const start = document.getElementById("start").value || todayISO();
+    const notes = document.getElementById("notes").value.trim();
+
+    if(!name) return alert("Name required.");
+    if(!deviceId) return alert("Device ID required.");
+
+    const end = addMonths(start, months);
+
+    const entry = {
+      id: cryptoRandomId(),
+      name,
+      deviceId,
+      start,
+      end,
+      months: months, // numeric
+      notes
+    };
+
+    entries.unshift(entry);
+    lastAddedIndex = 0;
+    saveLocal();
+    render();
+
+    document.getElementById("name").value = "";
+    document.getElementById("deviceId").value = "";
+    document.getElementById("notes").value = "";
+  }
+
+  function extendMonths(id, addM){
+    const e = entries.find(x=>x.id===id);
+    if(!e) return;
+    const base = e.end || todayISO();
+    e.end = addMonths(base, addM);
+    e.months = ""; // optional: keep original
+    saveLocal();
+    render();
+  }
+
+  function removeEntry(id){
+    if(!confirm("Remove this subscriber?")) return;
+    entries = entries.filter(x=>x.id!==id);
+    saveLocal();
+    render();
+  }
+
+  async function loadFromRaw(){
+    const rawUrl = document.getElementById("rawUrl").value.trim();
+    if(!rawUrl) return alert("Raw URL required.");
+    try{
+      const resp = await fetch(rawUrl, { cache: "no-store" });
+      const text = await resp.text();
+      if(!resp.ok){
+        console.error(text);
+        return alert("Failed to load raw file.");
+      }
+      document.getElementById("rawPreview").value = text;
+
+      const parsed = parseDeviceIdFile(text);
+      // Replace local entries with parsed (you can change this to merge if you want)
+      entries = parsed;
+      saveLocal();
+      lastAddedIndex = null;
+      render();
+      alert("Loaded and parsed current list.");
+    }catch(e){
+      alert("Load error: " + e.message);
+    }
+  }
+
+  async function appendLastAdded(){
+    if(lastAddedIndex === null || !entries[lastAddedIndex]) {
+      return alert("No newly added item to append. Add a subscriber first.");
+    }
+    const e = entries[lastAddedIndex];
+    const block = buildFileText([e]).trim();
+
+    await commitToGitHub({ mode: "append", entryText: block });
+  }
+
+  async function replaceAllToGitHub(){
+    const full = buildFileText(entries);
+    await commitToGitHub({ mode: "replace", entryText: full });
+  }
+
+  async function commitToGitHub({mode, entryText}){
+    const apiUrl = document.getElementById("apiUrl").value.trim();
+    const adminKey = document.getElementById("adminKey").value.trim();
+    if(!apiUrl || !adminKey) return alert("API URL and Admin Key required.");
+
+    const resp = await fetch(apiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type":"application/json",
+        "x-admin-key": adminKey
+      },
+      body: JSON.stringify({ mode, entryText })
+    });
+
+    const text = await resp.text();
+    if(!resp.ok){
+      console.error(text);
+      return alert("Commit failed. Check console.\n" + text.slice(0, 250));
+    }
+
+    alert("Committed to GitHub successfully!");
+    // Refresh raw preview (optional)
+    // Sometimes GitHub raw has short delay, but we try:
+    try{ await loadFromRaw(); } catch {}
+  }
+
+  function render(){
+    const q = (document.getElementById("search").value || "").toLowerCase();
+    const sort = document.getElementById("sort").value;
+
+    let list = entries.filter(e => {
+      if(!q) return true;
+      return (e.name||"").toLowerCase().includes(q) || (e.deviceId||"").toLowerCase().includes(q);
+    });
+
+    list = list.slice().sort((a,b)=>{
+      if(sort==="end_asc") return String(a.end||"").localeCompare(String(b.end||""));
+      if(sort==="end_desc") return String(b.end||"").localeCompare(String(a.end||""));
+      if(sort==="name_asc") return String(a.name||"").localeCompare(String(b.name||""));
+      if(sort==="name_desc") return String(b.name||"").localeCompare(String(a.name||""));
+      return 0;
+    });
+
+    const active = list.filter(e => e.end && statusOf(e.end)==="Active").length;
+    const expired = list.filter(e => e.end && statusOf(e.end)==="Expired").length;
+    document.getElementById("stats").textContent =
+      `Total: ${list.length} • Active: ${active} • Expired: ${expired}`;
+
+    const tbody = document.getElementById("tbody");
+    tbody.innerHTML = "";
+
+    for(const e of list){
+      const st = e.end ? statusOf(e.end) : "Unknown";
+      const badgeClass = st==="Active" ? "badge ok" : (st==="Expired" ? "badge bad" : "badge");
+
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td><b>${escapeHtml(e.name)}</b></td>
+        <td class="mono muted" style="word-break:break-all">${escapeHtml(e.deviceId||"")}</td>
+        <td>${escapeHtml(e.start||"-")}</td>
+        <td><b>${escapeHtml(e.end||"-")}</b></td>
+        <td><span class="${badgeClass}">${escapeHtml(st)}</span></td>
+        <td class="muted">${escapeHtml(e.notes||"")}</td>
+        <td class="actions">
+          <button onclick="extendMonths('${e.id}', 1)">+1mo</button>
+          <button onclick="extendMonths('${e.id}', 3)">+3mo</button>
+          <button onclick="removeEntry('${e.id}')">Remove</button>
+        </td>
+      `;
+      tbody.appendChild(tr);
+    }
+  }
+
+  // Init
+  if(!document.getElementById("start").value) document.getElementById("start").value = todayISO();
+  render();
+</script>
+
+</body>
+</html>
